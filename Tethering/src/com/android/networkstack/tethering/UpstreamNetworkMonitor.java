@@ -45,7 +45,6 @@ import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
 import com.android.internal.annotations.VisibleForTesting;
-import com.android.internal.util.StateMachine;
 import com.android.net.module.util.SharedLog;
 import com.android.networkstack.apishim.ConnectivityManagerShimImpl;
 import com.android.networkstack.apishim.common.ConnectivityManagerShim;
@@ -112,9 +111,8 @@ public class UpstreamNetworkMonitor {
 
     private final Context mContext;
     private final SharedLog mLog;
-    private final StateMachine mTarget;
     private final Handler mHandler;
-    private final int mWhat;
+    private final EventListener mEventListener;
     private final HashMap<Network, UpstreamNetworkState> mNetworkMap = new HashMap<>();
     private HashSet<IpPrefix> mLocalPrefixes;
     private ConnectivityManager mCM;
@@ -139,12 +137,11 @@ public class UpstreamNetworkMonitor {
     // Set if the Internet is considered reachable via a VPN network
     private Network mVpnInternetNetwork;
 
-    public UpstreamNetworkMonitor(Context ctx, StateMachine tgt, SharedLog log, int what) {
+    public UpstreamNetworkMonitor(Context ctx, Handler h, SharedLog log, EventListener listener) {
         mContext = ctx;
-        mTarget = tgt;
-        mHandler = mTarget.getHandler();
+        mHandler = h;
         mLog = log.forSubComponent(TAG);
-        mWhat = what;
+        mEventListener = listener;
         mLocalPrefixes = new HashSet<>();
         mIsDefaultCellularUpstream = false;
         mCM = (ConnectivityManager) ctx.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -386,11 +383,12 @@ public class UpstreamNetworkMonitor {
                     network, newNc));
         }
 
-        mNetworkMap.put(network, new UpstreamNetworkState(
-                prev.linkProperties, newNc, network));
+        final UpstreamNetworkState uns =
+                new UpstreamNetworkState(prev.linkProperties, newNc, network);
+        mNetworkMap.put(network, uns);
         // TODO: If sufficient information is available to select a more
         // preferable upstream, do so now and notify the target.
-        notifyTarget(EVENT_ON_CAPABILITIES, network);
+        mEventListener.onUpstreamEvent(EVENT_ON_CAPABILITIES, uns);
     }
 
     private @Nullable UpstreamNetworkState updateLinkProperties(@NonNull Network network,
@@ -423,7 +421,7 @@ public class UpstreamNetworkMonitor {
     private void handleLinkProp(Network network, LinkProperties newLp) {
         final UpstreamNetworkState ns = updateLinkProperties(network, newLp);
         if (ns != null) {
-            notifyTarget(EVENT_ON_LINKPROPERTIES, ns);
+            mEventListener.onUpstreamEvent(EVENT_ON_LINKPROPERTIES, ns);
         }
     }
 
@@ -454,7 +452,7 @@ public class UpstreamNetworkMonitor {
         // preferable upstream, do so now and notify the target.  Likewise,
         // if the current upstream network is gone, notify the target of the
         // fact that we now have no upstream at all.
-        notifyTarget(EVENT_ON_LOST, mNetworkMap.remove(network));
+        mEventListener.onUpstreamEvent(EVENT_ON_LOST, mNetworkMap.remove(network));
     }
 
     private void maybeHandleNetworkSwitch(@NonNull Network network) {
@@ -472,14 +470,14 @@ public class UpstreamNetworkMonitor {
         // Default network changed. Update local data and notify tethering.
         Log.d(TAG, "New default Internet network: " + network);
         mDefaultInternetNetwork = network;
-        notifyTarget(EVENT_DEFAULT_SWITCHED, ns);
+        mEventListener.onUpstreamEvent(EVENT_DEFAULT_SWITCHED, ns);
     }
 
     private void recomputeLocalPrefixes() {
         final HashSet<IpPrefix> localPrefixes = allLocalPrefixes(mNetworkMap.values());
         if (!mLocalPrefixes.equals(localPrefixes)) {
             mLocalPrefixes = localPrefixes;
-            notifyTarget(NOTIFY_LOCAL_PREFIXES, localPrefixes.clone());
+            mEventListener.onUpstreamEvent(NOTIFY_LOCAL_PREFIXES, localPrefixes.clone());
         }
     }
 
@@ -518,12 +516,13 @@ public class UpstreamNetworkMonitor {
                 // onLinkPropertiesChanged right after this method and mDefaultInternetNetwork will
                 // be updated then.
                 //
-                // Technically, not updating here isn't necessary, because the notifications to
-                // Tethering sent by notifyTarget are messages sent to a state machine running on
-                // the same thread as this method, and so cannot arrive until after this method has
-                // returned. However, it is not a good idea to rely on that because fact that
-                // Tethering uses multiple state machines running on the same thread is a major
-                // source of race conditions and something that should be fixed.
+                // Technically, mDefaultInternetNetwork could be updated here, because the
+                // Callback#onChange implementation sends messages to the state machine running
+                // on the same thread as this method. If there is new default network change,
+                // the message cannot arrive until onLinkPropertiesChanged returns.
+                // However, it is not a good idea to rely on that because fact that Tethering uses
+                // multiple state machines running on the same thread is a major source of race
+                // conditions and something that should be fixed.
                 //
                 // TODO: is it correct that this code always updates EntitlementManager?
                 // This code runs when the default network connects or changes capabilities, but the
@@ -567,7 +566,7 @@ public class UpstreamNetworkMonitor {
                 mIsDefaultCellularUpstream = false;
                 mEntitlementMgr.notifyUpstream(false);
                 Log.d(TAG, "Lost default Internet network: " + network);
-                notifyTarget(EVENT_DEFAULT_SWITCHED, null);
+                mEventListener.onUpstreamEvent(EVENT_DEFAULT_SWITCHED, null);
                 return;
             }
 
@@ -583,14 +582,6 @@ public class UpstreamNetworkMonitor {
 
     private void releaseCallback(NetworkCallback cb) {
         if (cb != null) cm().unregisterNetworkCallback(cb);
-    }
-
-    private void notifyTarget(int which, Network network) {
-        notifyTarget(which, mNetworkMap.get(network));
-    }
-
-    private void notifyTarget(int which, Object obj) {
-        mTarget.sendMessage(mWhat, which, 0, obj);
     }
 
     private static class TypeStatePair {
@@ -718,5 +709,11 @@ public class UpstreamNetworkMonitor {
     /** Set test network as preferred upstream. */
     public void setPreferTestNetworks(boolean prefer) {
         mPreferTestNetworks = prefer;
+    }
+
+    /** An interface to notify upstream network changes. */
+    public interface EventListener {
+        /** Notify the client of some event */
+        void onUpstreamEvent(int what, Object obj);
     }
 }
